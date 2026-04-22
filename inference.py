@@ -83,7 +83,7 @@ def _run_model(model: YOLO | None, image: np.ndarray) -> Any:
     return results[0] if results else None
 
 
-def _extract_canopy_hw_ratio(result: Any, image_shape: tuple[int, int, int]) -> tuple[float, float]:
+def _extract_canopy_hw_px(result: Any) -> tuple[float, float]:
     boxes = getattr(result, "boxes", None)
     if boxes is None or len(boxes) == 0:
         return 0.0, 0.0
@@ -93,8 +93,7 @@ def _extract_canopy_hw_ratio(result: Any, image_shape: tuple[int, int, int]) -> 
     heights = xyxy[:, 3] - xyxy[:, 1]
     max_w = float(np.max(widths)) if len(widths) else 0.0
     max_h = float(np.max(heights)) if len(heights) else 0.0
-    img_h, img_w = image_shape[0], image_shape[1]
-    return (max_h / img_h if img_h else 0.0, max_w / img_w if img_w else 0.0)
+    return max_h, max_w
 
 
 def _extract_leaf_area_ratio(result: Any, image_shape: tuple[int, int, int]) -> float:
@@ -109,7 +108,49 @@ def _extract_leaf_area_ratio(result: Any, image_shape: tuple[int, int, int]) -> 
     return area_pixels / image_area if image_area else 0.0
 
 
-def _extract_detections(result: Any) -> list[dict[str, Any]]:
+def _classify_color_name(rgb_crop: np.ndarray) -> str:
+    if rgb_crop.size == 0:
+        return "unknown"
+    mean_rgb = rgb_crop.reshape(-1, 3).mean(axis=0)
+    r, g, b = float(mean_rgb[0]), float(mean_rgb[1]), float(mean_rgb[2])
+
+    max_c = max(r, g, b)
+    min_c = min(r, g, b)
+    delta = max_c - min_c
+    if max_c == 0:
+        return "unknown"
+    saturation = delta / max_c
+
+    if saturation < 0.16:
+        if max_c < 50:
+            return "black"
+        if max_c > 200:
+            return "white"
+        return "gray"
+
+    if max_c == r:
+        hue = (60 * ((g - b) / delta) + 360) % 360 if delta else 0
+    elif max_c == g:
+        hue = (60 * ((b - r) / delta) + 120) if delta else 0
+    else:
+        hue = (60 * ((r - g) / delta) + 240) if delta else 0
+
+    if hue < 15 or hue >= 345:
+        return "red"
+    if hue < 45:
+        return "orange"
+    if hue < 70:
+        return "yellow"
+    if hue < 170:
+        return "green"
+    if hue < 255:
+        return "blue"
+    if hue < 320:
+        return "purple"
+    return "pink"
+
+
+def _extract_detections(result: Any, image: np.ndarray) -> list[dict[str, Any]]:
     boxes = getattr(result, "boxes", None)
     if boxes is None or len(boxes) == 0:
         return []
@@ -124,9 +165,15 @@ def _extract_detections(result: Any) -> list[dict[str, Any]]:
         class_id = int(cls[idx]) if cls is not None and idx < len(cls) else -1
         score = float(conf[idx]) if conf is not None and idx < len(conf) else 0.0
         label = str(names.get(class_id, class_id))
+        x1 = max(0, int(round(float(box[0]))))
+        y1 = max(0, int(round(float(box[1]))))
+        x2 = min(image.shape[1], int(round(float(box[2]))))
+        y2 = min(image.shape[0], int(round(float(box[3]))))
+        color = _classify_color_name(image[y1:y2, x1:x2])
         detections.append(
             {
                 "label": label,
+                "color": color,
                 "confidence": round(score, 4),
                 "bbox": {
                     "x1": round(float(box[0]), 2),
@@ -139,11 +186,11 @@ def _extract_detections(result: Any) -> list[dict[str, Any]]:
     return detections
 
 
-def _count_by_label(detections: list[dict[str, Any]]) -> dict[str, int]:
+def _count_by_key(detections: list[dict[str, Any]], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for item in detections:
-        label = str(item.get("label", "unknown"))
-        counts[label] = counts.get(label, 0) + 1
+        value = str(item.get(key, "unknown"))
+        counts[value] = counts.get(value, 0) + 1
     return counts
 
 
@@ -158,23 +205,40 @@ def run_inference(image_bytes: bytes) -> dict[str, Any]:
     fruit_result = _run_model(_fruit_model, image)
     leaf_result = _run_model(_leaf_model, image)
 
-    canopy_height, canopy_width = _extract_canopy_hw_ratio(canopy_result, image.shape)
+    canopy_height_px, canopy_width_px = _extract_canopy_hw_px(canopy_result)
+    pixel_to_cm = float(os.getenv("CANOPY_PIXEL_TO_CM", "1.0"))
+    canopy_height_cm = canopy_height_px * pixel_to_cm
+    canopy_width_cm = canopy_width_px * pixel_to_cm
+    canopy_area_cm2 = canopy_height_cm * canopy_width_cm
     leaf_area = _extract_leaf_area_ratio(leaf_result, image.shape)
-    canopy_area = leaf_area if leaf_area > 0 else canopy_height * canopy_width
-    canopy_detections = _extract_detections(canopy_result)
-    fruit_detections = _extract_detections(fruit_result)
-    leaf_detections = _extract_detections(leaf_result)
-    fruit_counts = _count_by_label(fruit_detections)
+    canopy_detections = _extract_detections(canopy_result, image)
+    fruit_detections = _extract_detections(fruit_result, image)
+    leaf_detections = _extract_detections(leaf_result, image)
+    fruit_counts = _count_by_key(fruit_detections, "label")
+    fruit_color_counts = _count_by_key(fruit_detections, "color")
+    leaf_counts = _count_by_key(leaf_detections, "label")
+    leaf_color_counts = _count_by_key(leaf_detections, "color")
     leaf_detection_count = len(leaf_detections)
 
     return {
-        "canopy_height": round(float(canopy_height), 4),
-        "canopy_width": round(float(canopy_width), 4),
-        "canopy_area": round(float(canopy_area), 4),
+        # Backward-compatible fields now represent centimeters.
+        "canopy_height": round(float(canopy_height_cm), 2),
+        "canopy_width": round(float(canopy_width_cm), 2),
+        "canopy_area": round(float(canopy_area_cm2), 4),
+        "canopy_height_px": round(float(canopy_height_px), 2),
+        "canopy_width_px": round(float(canopy_width_px), 2),
+        "canopy_height_cm": round(float(canopy_height_cm), 2),
+        "canopy_width_cm": round(float(canopy_width_cm), 2),
+        "canopy_area_cm2": round(float(canopy_area_cm2), 2),
+        "canopy_pixel_to_cm": pixel_to_cm,
+        "canopy_calibrated": pixel_to_cm != 1.0,
         "canopy_detections": canopy_detections,
         "fruit_detections": fruit_detections,
         "leaf_detections": leaf_detections,
         "fruit_counts": fruit_counts,
+        "fruit_color_counts": fruit_color_counts,
+        "leaf_counts": leaf_counts,
+        "leaf_color_counts": leaf_color_counts,
         "image_width": int(image.shape[1]),
         "image_height": int(image.shape[0]),
         "leaf": {
