@@ -109,23 +109,76 @@ def _extract_leaf_area_ratio(result: Any, image_shape: tuple[int, int, int]) -> 
     return area_pixels / image_area if image_area else 0.0
 
 
-def run_inference(image_bytes: bytes) -> dict[str, float]:
-    """Run all three models and return canopy-focused metrics."""
+def _extract_detections(result: Any) -> list[dict[str, Any]]:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    names = getattr(result, "names", {}) or {}
+    xyxy = boxes.xyxy.cpu().numpy()
+    conf = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else None
+    cls = boxes.cls.cpu().numpy() if getattr(boxes, "cls", None) is not None else None
+
+    detections: list[dict[str, Any]] = []
+    for idx, box in enumerate(xyxy):
+        class_id = int(cls[idx]) if cls is not None and idx < len(cls) else -1
+        score = float(conf[idx]) if conf is not None and idx < len(conf) else 0.0
+        label = str(names.get(class_id, class_id))
+        detections.append(
+            {
+                "label": label,
+                "confidence": round(score, 4),
+                "bbox": {
+                    "x1": round(float(box[0]), 2),
+                    "y1": round(float(box[1]), 2),
+                    "x2": round(float(box[2]), 2),
+                    "y2": round(float(box[3]), 2),
+                },
+            }
+        )
+    return detections
+
+
+def _count_by_label(detections: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in detections:
+        label = str(item.get("label", "unknown"))
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def run_inference(image_bytes: bytes) -> dict[str, Any]:
+    """Run all three models and return combined multi-model outputs."""
     if not _models_loaded:
         load_models()
 
     image = _decode_image(image_bytes)
 
     canopy_result = _run_model(_canopy_model, image)
-    _ = _run_model(_fruit_model, image)
+    fruit_result = _run_model(_fruit_model, image)
     leaf_result = _run_model(_leaf_model, image)
 
     canopy_height, canopy_width = _extract_canopy_hw_ratio(canopy_result, image.shape)
     leaf_area = _extract_leaf_area_ratio(leaf_result, image.shape)
     canopy_area = leaf_area if leaf_area > 0 else canopy_height * canopy_width
+    canopy_detections = _extract_detections(canopy_result)
+    fruit_detections = _extract_detections(fruit_result)
+    leaf_detections = _extract_detections(leaf_result)
+    fruit_counts = _count_by_label(fruit_detections)
+    leaf_detection_count = len(leaf_detections)
 
     return {
         "canopy_height": round(float(canopy_height), 4),
         "canopy_width": round(float(canopy_width), 4),
         "canopy_area": round(float(canopy_area), 4),
+        "canopy_detections": canopy_detections,
+        "fruit_detections": fruit_detections,
+        "leaf_detections": leaf_detections,
+        "fruit_counts": fruit_counts,
+        "image_width": int(image.shape[1]),
+        "image_height": int(image.shape[0]),
+        "leaf": {
+            "mask_area_ratio": round(float(leaf_area), 4),
+            "detection_count": leaf_detection_count,
+        },
     }

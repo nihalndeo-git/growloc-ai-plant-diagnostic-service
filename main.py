@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+from typing import Any
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -35,14 +37,10 @@ def health() -> dict[str, str]:
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)) -> dict[str, float]:
+async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
     data = await file.read()
     try:
         metrics = run_inference(data)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {
-        "canopy_height": metrics["canopy_height"],
-        "canopy_width": metrics["canopy_width"],
-        "canopy_area": metrics["canopy_area"],
-    }
+    return metrics
